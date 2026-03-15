@@ -1,0 +1,11 @@
+[Unit]
+Description=Chronovault Daily Backup Timer
+Requires=chronovault-backup.service
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 America/New_York
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

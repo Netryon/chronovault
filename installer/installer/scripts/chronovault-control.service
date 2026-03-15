@@ -1,0 +1,36 @@
+[Unit]
+Description=Chronovault Control API
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=chronovaultctl
+Group=chronovaultctl
+WorkingDirectory=/opt/chronovault/control/app
+EnvironmentFile=/opt/chronovault/env/control.env
+ExecStart=/opt/chronovault/control/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=2
+# =========================
+# Security Hardening
+# =========================
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Allow sudo + runtime state
+ReadWritePaths=/var/lib/chronovault/state
+ReadWritePaths=/var/lib/chronovault
+ReadWritePaths=/var/log/chronovault
+ReadWritePaths=/mnt/backup
+ReadWritePaths=/mnt/primary
+ReadWritePaths=/run
+ReadWritePaths=/run/sudo
+# Allow read-only access to required data
+ReadOnlyPaths=/opt/chronovault/scripts
+ReadOnlyPaths=/opt/chronovault/control/app
+ReadOnlyPaths=/opt/chronovault/env
+# DO NOT enable NoNewPrivileges
+# sudo is REQUIRED by design
+NoNewPrivileges=no
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Chronovault Weekly System Update Timer
+Requires=chronovault-system-update.service
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00 America/New_York
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

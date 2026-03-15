@@ -1,0 +1,28 @@
+[Unit]
+Description=Chronovault Notification Runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=chronovaultctl
+Group=chronovaultctl
+WorkingDirectory=/opt/chronovault/control/app
+
+EnvironmentFile=/opt/chronovault/env/control.env
+ExecStart=/opt/chronovault/control/venv/bin/python3 /opt/chronovault/control/app/notify.py
+
+# Hardening (match your control service style)
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+ReadWritePaths=/var/lib/chronovault/state
+ReadWritePaths=/var/lib/chronovault
+ReadWritePaths=/var/log/chronovault
+ReadWritePaths=/mnt/backup
+ReadWritePaths=/mnt/primary
+ReadWritePaths=/run
+
+ReadOnlyPaths=/opt/chronovault/control/app
+ReadOnlyPaths=/opt/chronovault/env

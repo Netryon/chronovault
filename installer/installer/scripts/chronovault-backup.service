@@ -1,0 +1,15 @@
+[Unit]
+Description=Chronovault Backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/chronovault/scripts/chronovault-backup-run
+EnvironmentFile=/opt/chronovault/env/control.env
+StandardOutput=journal
+StandardError=journal
+User=root
+
+[Install]
+WantedBy=multi-user.target

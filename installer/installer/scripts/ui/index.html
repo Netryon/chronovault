@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chronovault UI</title>
+    <link rel="icon" type="image/x-icon" href="favicon/favicon.ico">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon/favicon-16x16.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon/favicon-32x32.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="favicon/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="favicon/android-chrome-192x192.png">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo-container">
+                <img src="logo.png" alt="Chronovault" id="ui-logo" class="logo">
+            </div>
+            <div class="header-controls">
+                <div class="connection-status" id="connection-status">
+                    <span class="status-indicator" id="status-indicator"></span>
+                    <span id="connection-text">Disconnected</span>
+                </div>
+                <div class="token-input-group">
+                    <input 
+                        type="password" 
+                        id="token-input" 
+                        placeholder="Enter token"
+                        autocomplete="off"
+                    >
+                    <button class="btn btn-primary" id="connect-btn">Connect</button>
+                    <label class="remember-token">
+                        <input type="checkbox" id="remember-token-checkbox">
+                        Remember token (persists across reboots)
+                    </label>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Status Banner Card -->
+            <section class="card status-banner" id="status-banner">
+                <h2>Status</h2>
+                <div class="status-header">
+                    <span class="status-badge" id="status-badge">-</span>
+                    <div class="status-info">
+                        <div class="status-reason" id="status-reason">Loading...</div>
+                        <div class="status-times">
+                            <span id="last-attempt">-</span>
+                            <span id="last-success">-</span>
+                        </div>
+                        <div class="frozen-indicator" id="frozen-indicator" style="display: none;">
+                            ⚠️ FROZEN - Manual approval required
+                        </div>
+                    </div>
+                </div>
+                <button class="btn btn-secondary" id="refresh-status-btn">Refresh Status</button>
+            </section>
+
+            <!-- Actions Card -->
+            <section class="card actions-card">
+                <h2>Actions</h2>
+                <div class="actions-grid">
+                    <button class="btn btn-primary" id="approve-once-btn" disabled>
+                        Approve Once
+                    </button>
+                    <button class="btn btn-primary" id="run-backup-btn" disabled>
+                        Run Backup Now
+                    </button>
+                </div>
+                <div class="action-result" id="action-result"></div>
+            </section>
+
+            <!-- Warnings Card -->
+            <section class="card warnings-card">
+                <h2>Warnings</h2>
+                <div id="warnings-list" class="warnings-list">
+                    <div class="no-warnings">No warnings</div>
+                </div>
+            </section>
+
+            <!-- Change Metrics Card -->
+            <section class="card metrics-card">
+                <h2>Change Metrics</h2>
+                <div class="metrics-grid">
+                    <div class="metric">
+                        <label>Global Change</label>
+                        <span class="metric-value" id="global-change-pct">-</span>
+                    </div>
+                    <div class="metric">
+                        <label>Immich Delete</label>
+                        <span class="metric-value" id="immich-delete-pct">-</span>
+                    </div>
+                    <div class="metric">
+                        <label>Nextcloud Delete</label>
+                        <span class="metric-value" id="nextcloud-delete-pct">-</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Mirror Card -->
+            <section class="card mirror-card">
+                <h2>Mirror Status</h2>
+                <div class="mirror-info">
+                    <div class="info-row">
+                        <label>State:</label>
+                        <span id="mirror-state">-</span>
+                    </div>
+                    <div class="info-row">
+                        <label>Reason:</label>
+                        <span id="mirror-reason">-</span>
+                    </div>
+                    <div class="info-row">
+                        <label>Last Attempt:</label>
+                        <span id="mirror-last-attempt">-</span>
+                    </div>
+                    <div class="info-row">
+                        <label>Last Success:</label>
+                        <span id="mirror-last-success">-</span>
+                    </div>
+                    <div class="info-row">
+                        <label>Rsync Exit Code:</label>
+                        <span id="mirror-rsync-exit">-</span>
+                    </div>
+                    <div class="info-row">
+                        <label>Source:</label>
+                        <span class="path-text" id="mirror-source">-</span>
+                    </div>
+                    <div class="info-row">
+                        <label>Destination:</label>
+                        <span class="path-text" id="mirror-dest">-</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Snapshots Card -->
+            <section class="card snapshots-card">
+                <h2>Snapshots</h2>
+                <div class="snapshots-grid">
+                    <div class="snapshot-type">
+                        <h3>Daily</h3>
+                        <div class="info-row">
+                            <label>Created:</label>
+                            <span id="daily-created">-</span>
+                        </div>
+                        <div class="info-row">
+                            <label>Count:</label>
+                            <span id="daily-count">-</span>
+                        </div>
+                        <div class="info-row">
+                            <label>Oldest:</label>
+                            <span id="daily-oldest">-</span>
+                        </div>
+                    </div>
+                    <div class="snapshot-type">
+                        <h3>Weekly</h3>
+                        <div class="info-row">
+                            <label>Created:</label>
+                            <span id="weekly-created">-</span>
+                        </div>
+                        <div class="info-row">
+                            <label>Count:</label>
+                            <span id="weekly-count">-</span>
+                        </div>
+                        <div class="info-row">
+                            <label>Oldest:</label>
+                            <span id="weekly-oldest">-</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Restore Points Card -->
+            <section class="card restore-points-card" id="restore-points-card" style="display: none;">
+                <h2>Restore Points</h2>
+                
+                <!-- Restore Point Selection -->
+                <div class="restore-selection">
+                    <label for="restore-point-select"><strong>Select Restore Point:</strong></label>
+                    <select id="restore-point-select" class="restore-select" disabled>
+                        <option value="">Loading restore points...</option>
+                    </select>
+                    <div id="restore-point-details" class="restore-point-details" style="display: none;"></div>
+                </div>
+
+                <!-- Restore Apps Selection -->
+                <div class="restore-mode-selection" id="restore-mode-selection" style="display: none;">
+                    <label><strong>Restore Applications:</strong></label>
+                    <div class="restore-mode-options">
+                        <label class="radio-option">
+                            <input type="radio" name="restore-apps" value="both" checked>
+                            <span><strong>Restore Both</strong> - Immich + Nextcloud</span>
+                        </label>
+                        <label class="radio-option">
+                            <input type="radio" name="restore-apps" value="immich">
+                            <span><strong>Restore Immich Only</strong></span>
+                        </label>
+                        <label class="radio-option">
+                            <input type="radio" name="restore-apps" value="nextcloud">
+                            <span><strong>Restore Nextcloud Only</strong></span>
+                        </label>
+                    </div>
+                    <p class="restore-mode-note">
+                        <strong>Note:</strong> All restores include filesystem + databases + permissions (full restore).
+                    </p>
+                </div>
+
+                <!-- Restore Warnings -->
+                <div class="restore-warnings" id="restore-warnings" style="display: none;">
+                    <div class="warning-box">
+                        <h4>⚠️ Critical Warnings</h4>
+                        <ul>
+                            <li><strong>This will overwrite live data</strong> - All current files and databases will be replaced</li>
+                            <li><strong>Containers will be stopped</strong> - Services will be unavailable during restore</li>
+                            <li><strong>Operation is irreversible</strong> - Current state cannot be recovered after restore</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Restore Confirmations -->
+                <div class="restore-confirmations" id="restore-confirmations" style="display: none;">
+                    <label class="checkbox-option">
+                        <input type="checkbox" id="restore-confirm-checkbox">
+                        <span>I understand the risks and want to proceed with the restore</span>
+                    </label>
+                    <div class="restore-approval">
+                        <p><strong>Approval Required:</strong> You must approve this restore operation.</p>
+                        <button class="btn btn-secondary" id="restore-approve-btn" disabled>Approve Restore</button>
+                        <span id="restore-approval-status" class="approval-status"></span>
+                    </div>
+                </div>
+
+                <!-- Restore Actions -->
+                <div class="restore-actions" id="restore-actions" style="display: none;">
+                    <button class="btn btn-danger" id="restore-btn" disabled>Execute Restore</button>
+                    <div id="restore-status" class="restore-status" style="display: none;"></div>
+                </div>
+            </section>
+
+            <!-- Restore History Card -->
+            <section class="card restore-history-card">
+                <h2>Restore History</h2>
+                <div class="info-row">
+                    <label>Last Restore Time:</label>
+                    <span id="last-restore-time">-</span>
+                </div>
+                <div class="info-row">
+                    <label>Last Restore Type:</label>
+                    <span id="last-restore-type">-</span>
+                </div>
+                <div class="info-row">
+                    <label>Last Restore Source:</label>
+                    <span id="last-restore-source">-</span>
+                </div>
+            </section>
+
+            <!-- Advanced Card -->
+            <section class="card advanced-card">
+                <h2>Advanced</h2>
+                <div class="advanced-actions">
+                    <button class="btn btn-secondary" id="toggle-raw-json-btn">Show Raw Status JSON</button>
+                    <button class="btn btn-secondary" id="show-debug-btn">Show Debug Info</button>
+                    <button class="btn btn-secondary" id="test-connection-btn">Test Connection</button>
+                </div>
+                <pre id="raw-json" class="raw-json" style="display: none;"></pre>
+                <div id="connection-test-result" class="connection-test-result" style="display: none;"></div>
+                <div id="backup-test-result" class="connection-test-result" style="display: none;"></div>
+            </section>
+        </main>
+
+        <!-- Error Display -->
+        <div class="error-display" id="error-display"></div>
+
+        <!-- Debug Info (can be toggled) -->
+        <div class="debug-panel" id="debug-panel" style="display: none;">
+            <h3>Debug Information</h3>
+            <div class="debug-info">
+                <div><strong>API Base URL:</strong> <span id="debug-api-url">-</span></div>
+                <div><strong>Token Length:</strong> <span id="debug-token-length">0</span> characters</div>
+                <div><strong>Connection Status:</strong> <span id="debug-connection">-</span></div>
+                <div><strong>Last Health Check:</strong> <span id="debug-last-check">Never</span></div>
+                <div><strong>Last Error:</strong> <span id="debug-last-error">None</span></div>
+            </div>
+            <button class="btn btn-secondary" id="toggle-debug-btn">Hide Debug Info</button>
+        </div>
+
+        <!-- Modal for Confirmations -->
+        <div class="modal" id="confirm-modal" style="display: none;">
+            <div class="modal-content">
+                <h3 id="modal-title">Confirm Action</h3>
+                <p id="modal-message"></p>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+                    <button class="btn btn-primary" id="modal-confirm">Confirm</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Load config first, then app -->
+    <script src="/ui-config.js"></script>
+    <script src="app.js?v=9"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Chronovault notifier every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=chronovault-notify.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,800 @@
+#!/bin/bash
+# chronovault Backup Runner - Bash Orchestrator
+# Purpose: Mount BACKUP, call Python logic, always unmount on exit
+
+set -euo pipefail
+
+# Script paths
+SCRIPT_DIR="/opt/chronovault/scripts"
+MOUNT_SCRIPT="${SCRIPT_DIR}/chronovault-backup-mount"
+UMOUNT_SCRIPT="${SCRIPT_DIR}/chronovault-backup-umount"
+PYTHON_SCRIPT="${SCRIPT_DIR}/chronovault_backup.py"
+LOG_FILE="/var/log/chronovault/backup.log"
+STATUS_FILE="/var/lib/chronovault/status.json"
+STOPPED_CONTAINERS_FILE="/run/chronovault.stopped_containers"
+LOCK_FILE="/var/lib/chronovault/state/backup.lock"
+
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}"
+}
+
+# Find latest file matching a glob pattern
+latest_match() {
+    local pattern="$1"
+    bash -lc "ls -1t ${pattern} 2>/dev/null | head -n 1" || true
+}
+
+# Write ERROR status to status.json (preserves ALL existing fields)
+write_error_status() {
+    local reason="$1"
+    local now_iso
+    
+    # Get current EST time ISO timestamp with timezone offset
+    now_iso="$(TZ="America/New_York" date +%Y-%m-%dT%H:%M:%S%z | sed 's/\([0-9][0-9]\)$/:\1/')"
+    
+    # Ensure directory exists
+    mkdir -p "$(dirname "${STATUS_FILE}")"
+    
+    # Read existing status if it exists, otherwise start with empty object
+    local existing_status="{}"
+    if [ -f "${STATUS_FILE}" ]; then
+        existing_status=$(cat "${STATUS_FILE}" 2>/dev/null || echo "{}")
+    fi
+    
+    # Check if the update would actually change anything
+    local current_state
+    local current_reason
+    local current_attempt_time
+    current_state=$(echo "${existing_status}" | jq -r '.state // empty' 2>/dev/null || echo "")
+    current_reason=$(echo "${existing_status}" | jq -r '.reason // empty' 2>/dev/null || echo "")
+    current_attempt_time=$(echo "${existing_status}" | jq -r '.last_attempt_time // empty' 2>/dev/null || echo "")
+    
+    # Only update if something actually changed
+    if [ "${current_state}" = "ERROR" ] && [ "${current_reason}" = "${reason}" ] && [ "${current_attempt_time}" = "${now_iso}" ]; then
+        log "Status unchanged, skipping update"
+        return 0
+    fi
+    
+    # Merge existing status with new fields (preserves ALL existing fields)
+    local status_json
+    status_json=$(echo "${existing_status}" | jq \
+        --arg attempt_time "${now_iso}" \
+        --arg state "ERROR" \
+        --arg reason "${reason}" \
+        '. + {last_attempt_time: $attempt_time, state: $state, reason: $reason}')
+    
+    # Atomic write: write to temp file then rename (never deletes the original)
+    local temp_file="${STATUS_FILE}.tmp"
+    echo "${status_json}" > "${temp_file}"
+    mv "${temp_file}" "${STATUS_FILE}"
+    
+    log "Status updated: ERROR - ${reason}"
+}
+
+# Write RUNNING status to status.json (preserves existing fields)
+write_running_status() {
+    local reason="${1:-Backup started}"
+    local now_iso
+
+    now_iso="$(TZ="America/New_York" date +%Y-%m-%dT%H:%M:%S%z | sed 's/\([0-9][0-9]\)$/:\1/')"
+
+    mkdir -p "$(dirname "${STATUS_FILE}")"
+
+    local existing_status="{}"
+    if [ -f "${STATUS_FILE}" ]; then
+        existing_status=$(cat "${STATUS_FILE}" 2>/dev/null || echo "{}")
+    fi
+
+    # Skip write if already RUNNING
+    local current_state
+    current_state=$(echo "${existing_status}" | jq -r '.state // empty' 2>/dev/null || echo "")
+    if [ "${current_state}" = "RUNNING" ]; then
+        return 0
+    fi
+
+    local status_json
+    status_json=$(echo "${existing_status}" | jq \
+        --arg attempt_time "${now_iso}" \
+        --arg state "RUNNING" \
+        --arg reason "${reason}" \
+        '. + {last_attempt_time: $attempt_time, state: $state, reason: $reason}')
+
+    local temp_file="${STATUS_FILE}.tmp"
+    echo "${status_json}" > "${temp_file}"
+    mv "${temp_file}" "${STATUS_FILE}"
+
+    log "Status updated: RUNNING - ${reason}"
+}
+
+# Restart any stopped containers before backup
+restart_stopped_containers_before_backup() {
+    log "Checking for stopped containers before backup..."
+    
+    # Get list of stopped containers (exited or created status)
+    local stopped_ids
+    stopped_ids=$(docker ps -a --filter "status=exited" --filter "status=created" --format "{{.ID}}" 2>/dev/null || true)
+    
+    if [ -z "$stopped_ids" ]; then
+        log "No stopped containers found before backup."
+        return 0
+    fi
+    
+    log "WARNING: Found stopped containers before backup - restarting them..."
+    
+    # Restart each stopped container
+    echo "$stopped_ids" | while IFS= read -r container_id; do
+        if [ -n "$container_id" ]; then
+            local container_name
+            container_name=$(docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's|/||' || echo "$container_id")
+            log "Restarting stopped container: $container_name"
+            if docker start "$container_id" >/dev/null 2>&1; then
+                log "Container restarted: $container_name"
+            else
+                log "WARNING: Failed to restart container: $container_name"
+            fi
+        fi
+    done
+    
+    # Wait for containers to initialize
+    if [ -n "$stopped_ids" ]; then
+        log "Waiting for restarted containers to initialize..."
+        
+        # Check if any PostgreSQL containers were restarted
+        local postgres_check
+        postgres_check=$(echo "$stopped_ids" | while IFS= read -r container_id; do
+            if [ -n "$container_id" ]; then
+                docker inspect --format '{{.Name}}' "$container_id" 2>/dev/null | sed 's|/||' || echo ""
+            fi
+        done | grep -E "(postgres|immich-postgres|nextcloud-postgres)" || true)
+        
+        if [ -n "$postgres_check" ]; then
+            log "Database containers detected - waiting 20 seconds for them to be ready..."
+            sleep 20
+            log "Proceeding with backup (databases should be ready)"
+        else
+            log "Waiting 5 seconds for containers to initialize..."
+            sleep 5
+        fi
+    fi
+}
+
+# Stop all running containers for consistent backup
+stop_all_containers() {
+    log "Stopping all running containers for consistent backup..."
+    
+    # Get list of running container IDs
+    local running
+    mapfile -t running < <(docker ps -q 2>/dev/null || true)
+    
+    if [ "${#running[@]}" -eq 0 ]; then
+        log "No running containers to stop."
+        return 0
+    fi
+    
+    # Ensure /run exists
+    mkdir -p /run
+    
+    # Record what we stopped so we can restart only those
+    printf "%s\n" "${running[@]}" > "${STOPPED_CONTAINERS_FILE}"
+    
+    log "Stopping ${#running[@]} container(s)..."
+    
+    # Stop gracefully with 30 second timeout
+    if docker stop -t 30 "${running[@]}" >/dev/null 2>&1; then
+        log "Containers stopped: ${#running[@]}"
+    else
+        log "WARNING: Some containers may not have stopped gracefully"
+        # Continue anyway - we recorded what we tried to stop
+    fi
+}
+
+# Atomic PostgreSQL dump function (pg_dumpall --globals-only + pg_dump -Fc)
+dump_postgres() {
+    local cname="$1"
+    local db_prefix="$2"  # e.g., "immich" or "nextcloud"
+    local db_name="${3:-}"  # Optional: override database name (e.g., "immich" instead of reading from env)
+    
+    # Read env from container
+    local pg_user pg_db pg_pass
+    pg_user="$(docker exec -i "$cname" sh -lc 'printf "%s" "${POSTGRES_USER:-postgres}"' 2>/dev/null || echo "postgres")"
+    # Use provided db_name if given, otherwise read from container env
+    if [ -n "$db_name" ]; then
+        pg_db="$db_name"
+    else
+        pg_db="$(docker exec -i "$cname" sh -lc 'printf "%s" "${POSTGRES_DB:-postgres}"' 2>/dev/null || echo "postgres")"
+    fi
+    pg_pass="$(docker exec -i "$cname" sh -lc 'printf "%s" "${POSTGRES_PASSWORD}"' 2>/dev/null || echo "")"
+    
+    local TS
+    TS="$(date -u +%Y%m%dT%H%M%SZ)"
+    local DUMPDIR="/mnt/primary/backups/db"
+    
+    local globals="${DUMPDIR}/${db_prefix}_globals_${TS}.sql"
+    local dbdump="${DUMPDIR}/${db_prefix}_db_${TS}.dump"
+    
+    # Dump globals (roles, etc.) - atomic write pattern
+    local gtmp="${globals}.tmp"
+    local gerr="${globals}.err"
+    rm -f "$gtmp" "$gerr"
+    
+    # Run dump to temp file
+    if docker exec -i "$cname" sh -lc "export PGPASSWORD='$pg_pass'; pg_dumpall -h 127.0.0.1 -U '$pg_user' --globals-only" \
+      >"$gtmp" 2>"$gerr" && [ -s "$gtmp" ]; then
+        # Only move into place if successful and non-empty
+        mv -f "$gtmp" "$globals"
+        rm -f "$gerr"
+        log "${db_prefix} globals dump created: $(basename "$globals")"
+    else
+        # Remove temp file on failure
+        rm -f "$gtmp" "$gerr"
+        log "WARNING: ${db_prefix} globals dump failed (continuing backup)"
+        if [ -f "$gerr" ]; then
+            sed -n '1,200p' "$gerr" 2>/dev/null | while IFS= read -r line; do
+                log "$line"
+            done || true
+        fi
+    fi
+    
+    # Dump database (custom format for better restore) - atomic write pattern
+    local dtmp="${dbdump}.tmp"
+    local derr="${dbdump}.err"
+    rm -f "$dtmp" "$derr"
+    
+    # Run dump to temp file (using -Fc for custom format, equivalent to --format=custom)
+    if docker exec -i "$cname" sh -lc "export PGPASSWORD='$pg_pass'; pg_dump -h 127.0.0.1 -U '$pg_user' -d '$pg_db' -Fc --no-owner --no-acl" \
+      >"$dtmp" 2>"$derr" && [ -s "$dtmp" ]; then
+        # Only move into place if successful and non-empty
+        mv -f "$dtmp" "$dbdump"
+        rm -f "$derr"
+
+        # Verify dump is a valid custom-format archive
+        # Validation must happen while container is still running
+        local toc_list=""
+        local toc_tables="0"
+        local verr="${dbdump}.verify.err"
+        local vout="${dbdump}.verify.out"
+        rm -f "$verr" "$vout"
+        
+        # Check if container is still running before validation
+        if ! docker ps --format '{{.Names}}' | grep -qE "^${cname}$"; then
+            log "WARNING: ${db_prefix} container ${cname} not running; cannot validate dump (continuing backup)"
+            rm -f "$dbdump" "$verr" "$vout"
+            return 1
+        fi
+        
+        # Validate dump using file input
+        if ! docker exec -i "$cname" sh -c "pg_restore -l" < "$dbdump" >"$vout" 2>"$verr"; then
+            log "WARNING: ${db_prefix} DB dump invalid (pg_restore -l failed) (continuing backup)"
+            log "Dump file: $dbdump"
+            log "Dump size: $(stat -c%s "$dbdump" 2>/dev/null || echo "unknown") bytes"
+            log "Container: $cname"
+            if [ -f "$verr" ] && [ -s "$verr" ]; then
+                log "pg_restore stderr:"
+                while IFS= read -r line || [ -n "$line" ]; do
+                    log "  $line"
+                done < "$verr"
+            fi
+            if [ -f "$vout" ] && [ -s "$vout" ]; then
+                log "pg_restore stdout (first 20 lines):"
+                head -n 20 "$vout" | while IFS= read -r line || [ -n "$line" ]; do
+                    log "  $line"
+                done
+            fi
+            # Check if dump file has valid custom format header (magic bytes)
+            local first_bytes
+            first_bytes="$(head -c 5 "$dbdump" 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")"
+            log "Dump file first 5 bytes (hex): $first_bytes"
+            if [ "$first_bytes" != "504b0304" ] && [ "$first_bytes" != "504b0506" ]; then
+                log "WARNING: Dump file does not appear to be a valid custom format archive (expected ZIP-like header)"
+            fi
+            rm -f "$dbdump" "$verr" "$vout"
+            return 1
+        fi
+        
+        # Read TOC from captured output
+        if [ -f "$vout" ] && [ -s "$vout" ]; then
+            toc_list="$(cat "$vout")"
+        fi
+        rm -f "$verr" "$vout"
+
+        # Get table count from TOC listing
+        toc_tables="$(printf "%s" "$toc_list" | grep -c ' TABLE ' || true)"
+
+        # Size threshold check for Immich
+        local dump_size
+        dump_size="$(stat -c%s "$dbdump" 2>/dev/null || echo "0")"
+        if [ "$db_prefix" = "immich" ]; then
+            if [ "$dump_size" -lt 1048576 ]; then
+                log "WARNING: immich DB dump looks too small (${dump_size} bytes < 1MB); likely wrong DB or failed dump (continuing backup)"
+                rm -f "$dbdump"
+                return 1
+            fi
+        fi
+
+        # Nextcloud: check TOC table count
+        if [ "$db_prefix" = "nextcloud" ]; then
+            if [ "${toc_tables:-0}" -lt 50 ]; then
+                log "WARNING: nextcloud dump looks suspicious (few tables in TOC: ${toc_tables}) (continuing backup)"
+            fi
+        fi
+
+        log "${db_prefix} database dump created: $(basename "$dbdump") (${dump_size} bytes, TOC TABLE count: ${toc_tables})"
+        return 0
+    else
+        # Remove temp file on failure
+        rm -f "$dtmp" "$derr"
+        log "WARNING: ${db_prefix} database dump failed (continuing backup)"
+        if [ -f "$derr" ]; then
+            sed -n '1,200p' "$derr" 2>/dev/null | while IFS= read -r line; do
+                log "$line"
+            done || true
+        fi
+        return 1
+    fi
+}
+
+# Atomic MySQL/MariaDB dump function
+dump_mysql() {
+    local cname="$1"
+    local out="$2"
+    
+    local tmp="${out}.tmp"
+    local err="${out}.err"
+    rm -f "$tmp" "$err"
+    
+    # Run dump to temp file
+    if docker exec -i "$cname" sh -lc '
+        : "${MYSQL_DATABASE:=${MARIADB_DATABASE}}"
+        : "${MYSQL_USER:=${MARIADB_USER}}"
+        : "${MYSQL_PASSWORD:=${MARIADB_PASSWORD}}"
+        [ -n "$MYSQL_DATABASE" ] && [ -n "$MYSQL_USER" ] && [ -n "$MYSQL_PASSWORD" ] &&
+        mysqldump --single-transaction --quick --routines --triggers -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"
+    ' >"$tmp" 2>"$err" && [ -s "$tmp" ]; then
+        # Only move into place if successful and non-empty
+        mv -f "$tmp" "$out"
+        rm -f "$err"
+        return 0
+    else
+        # Remove temp file on failure
+        rm -f "$tmp" "$err"
+        log "WARNING: MySQL dump failed for $cname (continuing backup)"
+        if [ -f "$err" ]; then
+            sed -n '1,200p' "$err" 2>/dev/null | while IFS= read -r line; do
+                log "$line"
+            done || true
+        fi
+        return 1
+    fi
+}
+
+# Detect database engine for a container
+detect_db_engine() {
+    local cname="$1"
+    local image
+    
+    # Get container image name
+    image=$(docker ps --format '{{.Image}}' --filter "name=^${cname}$" 2>/dev/null || echo "")
+    
+    if [ -z "$image" ]; then
+        echo "unknown"
+        return 1
+    fi
+    
+    # Check image name for database type
+    case "$image" in
+        *postgres*|*postgresql*)
+            echo "postgres"
+            return 0
+            ;;
+        *mariadb*|*mysql*)
+            echo "mysql"
+            return 0
+            ;;
+        *)
+            # Try to detect by checking if pg_dumpall exists in container
+            if docker exec "$cname" command -v pg_dumpall >/dev/null 2>&1; then
+                echo "postgres"
+                return 0
+            elif docker exec "$cname" command -v mysqldump >/dev/null 2>&1; then
+                echo "mysql"
+                return 0
+            else
+                echo "unknown"
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Verify that DB dumps exist on BACKUP after rsync, and are readable (warning-only)
+verify_backup_dumps() {
+    local dir="/mnt/backup/chronovault/current/backups/db"
+    log "Verifying DB dumps exist on BACKUP mirror (warning-only)..."
+
+    if [ ! -d "$dir" ]; then
+        log "WARNING: BACKUP mirror dump directory missing: $dir"
+        return 0
+    fi
+
+    # Immich (Postgres) verification
+    local latest_immich=""
+    latest_immich="$(latest_match "$dir/immich_db_*Z.dump")"
+    if [ -n "$latest_immich" ]; then
+        log "Verify BACKUP latest immich dump: $latest_immich"
+        if [ ! -f "$latest_immich" ]; then
+            log "WARNING: Immich dump file not found: $latest_immich"
+        elif [ ! -s "$latest_immich" ]; then
+            log "WARNING: Immich dump file is empty: $latest_immich"
+        elif docker ps --format '{{.Names}}' | grep -qE '^immich-postgres$'; then
+            local verr_immich="/tmp/immich_verify.err"
+            local vout_immich="/tmp/immich_verify.out"
+            rm -f "$verr_immich" "$vout_immich"
+            
+            # Use file input instead of pipe (more reliable)
+            if ! docker exec -i immich-postgres sh -c "pg_restore -l" < "$latest_immich" >"$vout_immich" 2>"$verr_immich"; then
+                log "WARNING: Immich BACKUP dump verification failed (pg_restore -l)"
+                log "Dump file: $latest_immich"
+                log "Dump size: $(stat -c%s "$latest_immich" 2>/dev/null || echo "unknown") bytes"
+                if [ -f "$verr_immich" ] && [ -s "$verr_immich" ]; then
+                    log "pg_restore stderr:"
+                    while IFS= read -r line || [ -n "$line" ]; do
+                        log "  $line"
+                    done < "$verr_immich"
+                else
+                    log "No error output captured"
+                fi
+                # Check magic bytes
+                local first_bytes
+                first_bytes="$(head -c 5 "$latest_immich" 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo "")"
+                log "Dump file first 5 bytes (hex): $first_bytes"
+            else
+                # Verification passed - show TOC count if available
+                local toc_count="0"
+                if [ -f "$vout_immich" ] && [ -s "$vout_immich" ]; then
+                    toc_count="$(grep -c ' TABLE ' "$vout_immich" 2>/dev/null || echo "0")"
+                fi
+                log "Immich BACKUP dump verification passed (TOC TABLE count: $toc_count)"
+            fi
+            rm -f "$verr_immich" "$vout_immich"
+        else
+            log "WARNING: immich-postgres container not running; cannot verify immich dump contents"
+        fi
+    else
+        log "WARNING: No immich_db_*Z.dump found on BACKUP mirror"
+    fi
+
+    # Nextcloud verification (engine-aware)
+    local nextcloud_db_container=""
+    local nextcloud_db_engine=""
+    if docker ps --format '{{.Names}}' | grep -qE '^nextcloud-postgres$'; then
+        nextcloud_db_container="nextcloud-postgres"
+    elif docker ps --format '{{.Names}}' | grep -qE '^nextcloud-db$'; then
+        nextcloud_db_container="nextcloud-db"
+    else
+        nextcloud_db_container="$(docker ps --format '{{.Names}}' | grep -iE 'nextcloud.*db|db.*nextcloud' | head -n1 || true)"
+    fi
+
+    if [ -n "$nextcloud_db_container" ]; then
+        nextcloud_db_engine="$(detect_db_engine "$nextcloud_db_container" || true)"
+        if [ "$nextcloud_db_engine" = "postgres" ]; then
+            local latest_nc=""
+            latest_nc="$(latest_match "$dir/nextcloud_db_*Z.dump")"
+            if [ -n "$latest_nc" ]; then
+                log "Verify BACKUP latest nextcloud dump: $latest_nc"
+                local verr_nc="/tmp/nextcloud_verify.err"
+                rm -f "$verr_nc"
+                if ! cat "$latest_nc" | docker exec -i "$nextcloud_db_container" pg_restore -l >/dev/null 2>"$verr_nc"; then
+                    log "WARNING: Nextcloud BACKUP dump verification failed (pg_restore -l)"
+                    if [ -f "$verr_nc" ] && [ -s "$verr_nc" ]; then
+                        log "Error details:"
+                        while IFS= read -r line || [ -n "$line" ]; do
+                            log "  $line"
+                        done < "$verr_nc"
+                    fi
+                else
+                    log "Nextcloud BACKUP dump verification passed"
+                fi
+                rm -f "$verr_nc"
+            else
+                log "WARNING: No nextcloud_db_*Z.dump found on BACKUP mirror"
+            fi
+        elif [ "$nextcloud_db_engine" = "mysql" ]; then
+            local latest_nc_sql=""
+            latest_nc_sql="$(latest_match "$dir/nextcloud_mysql_*Z.sql")"
+            if [ -n "$latest_nc_sql" ]; then
+                log "Verify BACKUP latest nextcloud mysql dump exists: $latest_nc_sql"
+                if [ ! -s "$latest_nc_sql" ]; then
+                    log "WARNING: Nextcloud MySQL dump on BACKUP is empty"
+                fi
+            else
+                log "WARNING: No nextcloud_mysql_*Z.sql found on BACKUP mirror"
+            fi
+        else
+            log "WARNING: Could not detect Nextcloud DB engine; skipping BACKUP dump verification"
+        fi
+    else
+        log "WARNING: Nextcloud database container not found; skipping BACKUP dump verification"
+    fi
+}
+
+# Create database dumps for perfect restore
+create_database_dumps() {
+    log "Creating database dumps for perfect restore..."
+    
+    local TS
+    local DUMPDIR="/mnt/primary/backups/db"
+    
+    # Get UTC timestamp for dump filename
+    TS="$(date -u +%Y%m%dT%H%M%SZ)"
+    
+    # Ensure dump directory exists with proper permissions
+    mkdir -p "$DUMPDIR"
+    chmod 700 "$DUMPDIR"
+    
+    # Immich Postgres dump (explicitly use "immich" database name)
+    if docker ps --format '{{.Names}}' | grep -qE '^immich-postgres$'; then
+        log "Creating Immich PostgreSQL dump..."
+        dump_postgres "immich-postgres" "immich" "immich" || log "Immich dump failed (continuing backup)"
+    else
+        log "Immich PostgreSQL container not running, skipping dump"
+    fi
+    
+    # Nextcloud database dump (detect engine)
+    local nextcloud_db_container=""
+    local nextcloud_db_engine=""
+    
+    # Find Nextcloud database container
+    if docker ps --format '{{.Names}}' | grep -qE '^nextcloud-postgres$'; then
+        nextcloud_db_container="nextcloud-postgres"
+    elif docker ps --format '{{.Names}}' | grep -qE '^nextcloud-db$'; then
+        nextcloud_db_container="nextcloud-db"
+    else
+        # Try to find any container with nextcloud and db in name
+        nextcloud_db_container=$(docker ps --format '{{.Names}}' | grep -iE 'nextcloud.*db|db.*nextcloud' | head -n1 || echo "")
+    fi
+    
+    if [ -n "$nextcloud_db_container" ]; then
+        log "Detected Nextcloud database container: $nextcloud_db_container"
+        nextcloud_db_engine=$(detect_db_engine "$nextcloud_db_container")
+        
+        case "$nextcloud_db_engine" in
+            postgres)
+                log "Creating Nextcloud PostgreSQL dump..."
+                dump_postgres "$nextcloud_db_container" "nextcloud" || log "Nextcloud PostgreSQL dump failed (continuing...)"
+                ;;
+            mysql)
+                log "Creating Nextcloud MySQL/MariaDB dump..."
+                dump_mysql "$nextcloud_db_container" "$DUMPDIR/nextcloud_mysql_${TS}.sql" || log "Nextcloud MySQL dump failed (continuing...)"
+                ;;
+            *)
+                log "WARNING: Could not detect Nextcloud database engine for container $nextcloud_db_container, skipping dump"
+                ;;
+        esac
+    else
+        log "Nextcloud database container not found, skipping dump"
+    fi
+    
+    # Cleanup old dumps (keep last 14 days)
+    log "Cleaning up old dumps (keeping last 14 days)..."
+    local deleted_count
+    deleted_count=$(find "$DUMPDIR" -type f \( -name "*_globals_*.sql" -o -name "*_db_*.dump" -o -name "*_mysql_*.sql" \) -mtime +14 -delete -print | wc -l)
+    if [ "${deleted_count:-0}" -gt 0 ]; then
+        log "Deleted ${deleted_count} old dump file(s)"
+    fi
+    
+    # Ensure proper ownership/permissions for dump directory
+    chown -R root:root "$DUMPDIR" 2>/dev/null || true
+    chmod 700 "$DUMPDIR" 2>/dev/null || true
+}
+
+# Restart containers that were stopped
+start_stopped_containers() {
+    if [ ! -f "${STOPPED_CONTAINERS_FILE}" ] || [ ! -s "${STOPPED_CONTAINERS_FILE}" ]; then
+        log "No containers recorded to restart."
+        return 0
+    fi
+    
+    log "Restarting containers that were stopped..."
+    
+    local stopped
+    mapfile -t stopped < "${STOPPED_CONTAINERS_FILE}"
+    
+    if [ "${#stopped[@]}" -eq 0 ]; then
+        log "No containers to restart."
+        rm -f "${STOPPED_CONTAINERS_FILE}"
+        return 0
+    fi
+    
+    # Start containers (ignore errors - some may have been removed)
+    if docker start "${stopped[@]}" >/dev/null 2>&1; then
+        log "Containers restarted: ${#stopped[@]}"
+    else
+        log "WARNING: Some containers may not have restarted (they may have been removed)"
+    fi
+    
+    rm -f "${STOPPED_CONTAINERS_FILE}"
+}
+
+# Acquire lock file (non-blocking)
+acquire_lock() {
+    mkdir -p "$(dirname "${LOCK_FILE}")"
+    
+    # Check if lock file exists and if it's stale (older than 2 hours)
+    if [ -f "${LOCK_FILE}" ]; then
+        local lock_age
+        lock_age=$(find "${LOCK_FILE}" -mmin +120 2>/dev/null | wc -l)
+        if [ "${lock_age}" -gt 0 ]; then
+            log "WARNING: Stale lock file detected (older than 2 hours), removing..."
+            rm -f "${LOCK_FILE}"
+        else
+            log "ERROR: Backup already in progress (lock file exists: ${LOCK_FILE})"
+            log "If no backup is running, remove the lock file manually: rm -f ${LOCK_FILE}"
+            return 1
+        fi
+    fi
+    
+    # Create lock file with PID
+    echo $$ > "${LOCK_FILE}"
+    log "Lock acquired (PID: $$)"
+    return 0
+}
+
+# Release lock file
+release_lock() {
+    if [ -f "${LOCK_FILE}" ]; then
+        local lock_pid
+        lock_pid=$(cat "${LOCK_FILE}" 2>/dev/null || echo "")
+        if [ "${lock_pid}" = "$$" ] || [ -z "${lock_pid}" ]; then
+            rm -f "${LOCK_FILE}"
+            log "Lock released"
+        else
+            log "WARNING: Lock file contains different PID (${lock_pid} vs $$), not removing"
+        fi
+    fi
+}
+
+# Cleanup function - always runs on exit
+cleanup() {
+    local exit_code=$?
+    
+    # Release lock file
+    release_lock
+    
+    # Always restart containers first (before unmounting)
+    start_stopped_containers
+
+    # Restart any containers that are still stopped
+    local still_stopped
+    still_stopped=$(docker ps -a --filter "status=exited" --format "{{.Names}}" 2>/dev/null | grep -v "^$" || true)
+    if [ -n "$still_stopped" ]; then
+        log "WARNING: Some containers are still stopped after backup: $still_stopped"
+        echo "$still_stopped" | while IFS= read -r container_name; do
+            if [ -n "$container_name" ]; then
+                log "Attempting to restart stopped container: $container_name"
+                if docker start "$container_name" >/dev/null 2>&1; then
+                    log "Successfully restarted: $container_name"
+                else
+                    log "WARNING: Failed to restart container: $container_name"
+                fi
+            fi
+        done
+    fi
+
+    # Verify dumps exist on BACKUP after rsync
+    verify_backup_dumps || true
+    
+    log "Cleanup: Unmounting BACKUP..."
+    
+    # Unmount and close BACKUP (ignore errors in cleanup to ensure we try)
+    if ! "${UMOUNT_SCRIPT}" 2>/dev/null; then
+        log "WARNING: Cleanup unmount had issues (may already be unmounted)"
+    fi
+    
+    if [ ${exit_code} -eq 0 ]; then
+        log "backup finished OK"
+    else
+        log "backup finished with ERROR (exit code: ${exit_code})"
+    fi
+    
+    exit ${exit_code}
+}
+
+# Set trap to always run cleanup on exit
+trap cleanup EXIT INT TERM
+
+# Main execution
+main() {
+    log "backup start"
+    
+    # Acquire lock to prevent concurrent backups
+    if ! acquire_lock; then
+        write_error_status "Backup already in progress (lock file exists)"
+        exit 1
+    fi
+
+    # Update status to RUNNING immediately so UI knows backup has started
+    write_running_status "Backup started"
+
+    # Mount BACKUP disk with retry logic
+    log "Mounting BACKUP disk..."
+    local mount_output
+    local mount_exit_code
+    local mount_retries=5
+    local mount_retry_delay=3
+    local mount_success=false
+    
+    for attempt in $(seq 1 ${mount_retries}); do
+        if mount_output=$("${MOUNT_SCRIPT}" 2>&1); then
+            mount_success=true
+            log "BACKUP disk mounted successfully"
+            # Verify mount point
+            if ! mountpoint -q /mnt/backup; then
+                log "WARNING: Mount script reported success but /mnt/backup is not a mount point!"
+                mount_success=false
+                mount_exit_code=1
+                break
+            fi
+            break
+        else
+            mount_exit_code=$?
+            # Check if error is retryable (timing issue after reboot)
+            if echo "${mount_output}" | grep -qE "(IDENTITY missing|directory.*does not exist)"; then
+                if [ ${attempt} -lt ${mount_retries} ]; then
+                    log "Mount failed (attempt ${attempt}/${mount_retries}): Filesystem not ready - may be timing issue after reboot, retrying in ${mount_retry_delay}s..."
+                    sleep ${mount_retry_delay}
+                    mount_retry_delay=$((mount_retry_delay * 2))
+                    continue
+                fi
+            fi
+            break
+        fi
+    done
+    
+    if [ "${mount_success}" = "false" ]; then
+        log "Mount failed (exit code: ${mount_exit_code}) after ${mount_retries} attempts"
+        log "Mount output: ${mount_output}"
+        
+        # Write ERROR status to status.json
+        local error_reason="Mount failed: ${mount_output}"
+        # Truncate reason if too long (keep first 200 chars)
+        if [ ${#error_reason} -gt 200 ]; then
+            error_reason="${error_reason:0:197}..."
+        fi
+        write_error_status "${error_reason}"
+        
+        exit 1
+    fi
+    
+    # Restart stopped containers before backup
+    restart_stopped_containers_before_backup
+    
+    # Create database dumps while containers are running
+    create_database_dumps
+    
+    # Stop containers for consistent backup
+    stop_all_containers
+    
+    # Flush filesystem buffers
+    log "Flushing filesystem buffers..."
+    sync
+    
+    # Call Python backup script
+    log "Calling Python backup script..."
+    local python_exit_code=0
+    if [ -n "${chronovault_FORCE_WEEKLY:-}" ]; then
+        chronovault_FORCE_WEEKLY="${chronovault_FORCE_WEEKLY}" python3 "${PYTHON_SCRIPT}" || python_exit_code=$?
+    else
+        python3 "${PYTHON_SCRIPT}" || python_exit_code=$?
+    fi
+    
+    if [ ${python_exit_code} -eq 0 ]; then
+        log "Python script completed successfully"
+    else
+        log "Python script failed with exit code: ${python_exit_code}"
+        exit ${python_exit_code}
+    fi
+}
+
+# Run main function
+main 
