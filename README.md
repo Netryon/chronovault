@@ -239,7 +239,7 @@ Optimized for low-power hardware.
 | Backup         | SATA SSD                    |
 | Connectivity   | USB3–SATA adapter; external power for drives |
 
-Also runs on Raspberry Pi 3B+, Pi 5, or other Debian-based systems.
+Also runs on Raspberry Pi 5, or other Debian-based systems.
 
 ---
 
