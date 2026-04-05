@@ -354,19 +354,19 @@ This project demonstrates:
 
 Status, backup/mirror health, change metrics, snapshots, restore points, and actions (Run Backup Now, Approve Once).
 
-![ChronoVault Control Dashboard](dashboard.png)
+![ChronoVault Control Dashboard](assets/dashboard.png)
 
 ### Nextcloud (documents)
 
 Document and file storage with folder tree, search, and sharing.
 
-![Nextcloud file interface](nextcloud.png)
+![Nextcloud file interface](assets/nextcloud.png)
 
 ### Immich (photos)
 
 Photo and video library with timeline, albums, and storage view.
 
-![Immich photo interface](immich.png)
+![Immich photo interface](assets/immich.png)
 
 *System architecture diagram to be added.*
 
