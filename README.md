@@ -380,6 +380,6 @@ A custom case was designed for ChronoVault hardware. STL files will be published
 
 ## License and Disclaimer
 
-**License:** MIT License.
+**License:** [MIT](LICENSE) (SPDX: `MIT`).
 
 ChronoVault is a **prototype storage platform** intended for learning, experimentation, and homelab use. Review and adapt configurations and security settings before relying on it in production or for critical data.
