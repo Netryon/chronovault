@@ -87,6 +87,8 @@ class Step15SetupControl(BaseStep):
     volumes:
       - /var/lib/chronovault:/usr/share/nginx/html:ro
       - /opt/chronovault/control/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
     command: >
       /bin/sh -c "envsubst '$$CHRONOVAULT_UI_TOKEN' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
       && nginx -g 'daemon off;'"

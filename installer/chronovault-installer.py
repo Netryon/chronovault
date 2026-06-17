@@ -36,7 +36,7 @@ from installer.steps.step14_nextcloud import Step14InstallNextcloud
 from installer.steps.step15_control import Step15SetupControl
 from installer.steps.step16_initial_backup import Step16InitialBackup
 from installer.steps.step17_email_notifications import Step17EmailNotifications
-from installer.steps.step18_timers_watchtower import Step18TimersWatchtower
+from installer.steps.step18_timers_watchtower import Step18TimersContainerMaintenance
 
 
 def main():
@@ -65,7 +65,7 @@ def main():
     installer.register_step(Step15SetupControl(installer))
     installer.register_step(Step16InitialBackup(installer))
     installer.register_step(Step17EmailNotifications(installer))
-    installer.register_step(Step18TimersWatchtower(installer))
+    installer.register_step(Step18TimersContainerMaintenance(installer))
     
     # Run installation
     try:

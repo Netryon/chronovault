@@ -322,7 +322,10 @@ class ChronovaultInstaller:
         self.log.info(f"   • View all containers: {Colors.GREEN}sudo docker ps -a{Colors.NC}")
         self.log.info(f"   • Check backup timer: {Colors.GREEN}sudo systemctl status chronovault-backup.timer{Colors.NC}")
         self.log.info(f"   • Check notification timer: {Colors.GREEN}sudo systemctl status chronovault-notify.timer{Colors.NC}")
+        self.log.info(f"   • Check container update timer: {Colors.GREEN}sudo systemctl status chronovault-container-update.timer{Colors.NC}")
+        self.log.info(f"   • Check stack guard timer: {Colors.GREEN}sudo systemctl status chronovault-stack-guard.timer{Colors.NC}")
         self.log.info(f"   • Manual backup: {Colors.GREEN}sudo /opt/chronovault/scripts/chronovault-backup-run{Colors.NC}")
+        self.log.info(f"   • Container update dry-run: {Colors.GREEN}sudo /opt/chronovault/scripts/chronovault-container-update.sh --dry-run{Colors.NC}")
         print()
         
         self.log.info(f"{Colors.CYAN}{Colors.BOLD}━━━ ACCESS INFORMATION ━━━{Colors.NC}")
@@ -366,8 +369,12 @@ class ChronovaultInstaller:
         self.log.info(f"  {Colors.GREEN}Weekly on Sunday at 4:00 AM (America/New_York){Colors.NC}")
         print()
         
-        self.log.info(f"{Colors.CYAN}Container Updates (Watchtower):{Colors.NC}")
-        self.log.info(f"  {Colors.GREEN}Daily at 5:00 AM (America/New_York){Colors.NC}")
+        self.log.info(f"{Colors.CYAN}Container Updates (Safe Updater):{Colors.NC}")
+        self.log.info(f"  {Colors.GREEN}Daily at 5:00 AM UTC (compose-stack pull + up){Colors.NC}")
+        print()
+        
+        self.log.info(f"{Colors.CYAN}Stack Guard:{Colors.NC}")
+        self.log.info(f"  {Colors.GREEN}Every 15 minutes (heal missing/unhealthy stacks){Colors.NC}")
         print()
         
         self.log.info(f"{Colors.CYAN}Email Notifications:{Colors.NC}")

@@ -1,0 +1,12 @@
+[Unit]
+Description=ChronoVault Safe Container Update
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/chronovault/scripts/chronovault-container-update.sh
+StandardOutput=journal
+StandardError=journal
+User=root

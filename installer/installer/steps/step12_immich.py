@@ -62,12 +62,16 @@ DB_PASSWORD={db_password}
    ports:
      - "2283:2283"
    depends_on:
-     - redis
-     - database
+     redis:
+       condition: service_started
+     database:
+       condition: service_healthy
    restart: unless-stopped
    volumes:
      - /mnt/primary/apps/immich/upload:/usr/src/app/upload
      - /mnt/primary/apps/immich/library:/usr/src/app/upload/library
+   labels:
+     - "com.centurylinklabs.watchtower.enable=false"
 
  immich-machine-learning:
    image: ghcr.io/immich-app/immich-machine-learning:${{IMMICH_VERSION:-{immich_version}}}
@@ -75,11 +79,15 @@ DB_PASSWORD={db_password}
    env_file:
      - /opt/chronovault/env/immich.env
    restart: unless-stopped
+   labels:
+     - "com.centurylinklabs.watchtower.enable=false"
 
  redis:
    image: redis:7-alpine
    container_name: immich-redis
    restart: unless-stopped
+   labels:
+     - "com.centurylinklabs.watchtower.enable=false"
 
  database:
    image: ghcr.io/immich-app/postgres:16-vectorchord0.3.0-pgvectors0.3.0
@@ -89,6 +97,14 @@ DB_PASSWORD={db_password}
    restart: unless-stopped
    volumes:
      - /mnt/primary/apps/immich/postgres:/var/lib/postgresql/data
+   labels:
+     - "com.centurylinklabs.watchtower.enable=false"
+   healthcheck:
+     test: ["CMD-SHELL", "pg_isready -U postgres -d immich"]
+     interval: 10s
+     timeout: 5s
+     retries: 5
+     start_period: 30s
 
 networks:
  default:
@@ -127,7 +143,10 @@ networks:
         # Check if API is responding (optional - may take time)
         try:
             import urllib.request
-            urllib.request.urlopen('http://localhost:2283/api/server-info/ping', timeout=10)
+            try:
+                urllib.request.urlopen('http://localhost:2283/api/server/ping', timeout=10)
+            except Exception:
+                urllib.request.urlopen('http://localhost:2283/api/server-info/ping', timeout=10)
             self.log.success("Immich is running and API is responding!")
         except Exception:
             self.log.warning("Immich containers are running but API not ready yet.")

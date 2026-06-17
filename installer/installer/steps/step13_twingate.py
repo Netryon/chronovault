@@ -66,6 +66,8 @@ TWINGATE_REFRESH_TOKEN={refresh_token}
     environment:
       - TWINGATE_LABEL_HOSTNAME=chronovault
       - TWINGATE_LABEL_DEPLOYED_BY=docker
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
 """
         
         # Create directory for Twingate compose file

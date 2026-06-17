@@ -19,6 +19,15 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}"
 }
 
+write_backup_db_missing_state() {
+    local nc_missing="$1"
+    local immich_missing="$2"
+    local state_file="/var/lib/chronovault/state/backup-db-missing.json"
+    mkdir -p "$(dirname "${state_file}")"
+    printf '{"nextcloud_db":%s,"immich_db":%s,"time":"%s"}\n' \
+        "${nc_missing}" "${immich_missing}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${state_file}"
+}
+
 # Find latest file matching a glob pattern
 latest_match() {
     local pattern="$1"
@@ -533,11 +542,15 @@ create_database_dumps() {
     chmod 700 "$DUMPDIR"
     
     # Immich Postgres dump (explicitly use "immich" database name)
+    local nc_db_missing=false
+    local immich_db_missing=false
     if docker ps --format '{{.Names}}' | grep -qE '^immich-postgres$'; then
         log "Creating Immich PostgreSQL dump..."
         dump_postgres "immich-postgres" "immich" "immich" || log "Immich dump failed (continuing backup)"
     else
         log "Immich PostgreSQL container not running, skipping dump"
+        log "ALERT: immich DB container missing during backup"
+        immich_db_missing=true
     fi
     
     # Nextcloud database dump (detect engine)
@@ -573,6 +586,14 @@ create_database_dumps() {
         esac
     else
         log "Nextcloud database container not found, skipping dump"
+        log "ALERT: nextcloud DB container missing during backup"
+        nc_db_missing=true
+    fi
+
+    if [ "${nc_db_missing}" = true ] || [ "${immich_db_missing}" = true ]; then
+        write_backup_db_missing_state "${nc_db_missing}" "${immich_db_missing}"
+    else
+        rm -f /var/lib/chronovault/state/backup-db-missing.json
     fi
     
     # Cleanup old dumps (keep last 14 days)
@@ -663,6 +684,16 @@ cleanup() {
     
     # Always restart containers first (before unmounting)
     start_stopped_containers
+
+    # Ensure critical compose stacks are whole (not just individual container IDs)
+    for stack in nextcloud immich; do
+        local stack_dir="/opt/chronovault/compose/${stack}"
+        if [ -d "$stack_dir" ]; then
+            log "Reconciling compose stack: ${stack}"
+            (cd "$stack_dir" && docker compose up -d) >/dev/null 2>&1 || \
+                log "WARNING: compose up -d failed for ${stack}"
+        fi
+    done
 
     # Restart any containers that are still stopped
     local still_stopped

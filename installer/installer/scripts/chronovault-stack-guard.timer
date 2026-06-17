@@ -1,0 +1,12 @@
+[Unit]
+Description=ChronoVault Stack Guard (every 15 minutes)
+Requires=chronovault-stack-guard.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=chronovault-stack-guard.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

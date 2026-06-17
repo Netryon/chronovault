@@ -52,6 +52,8 @@ UPDATE_INTERVAL_SECONDS=300
     env_file:
       - /opt/chronovault/env/duckdns.env
     network_mode: host
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
     command: >
       sh -c "apk add --no-cache curl iproute2 >/dev/null
       && while true; do

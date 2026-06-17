@@ -5,7 +5,7 @@ Chronovault notifier (SMTP email)
 Reads Chronovault status + local system signals and sends email alerts.
 Keeps a small state file to avoid spamming the same alert repeatedly.
 
-Selected alerts (7 total):
+Selected alerts (10 total):
 - A1: Backup not OK (persistent)
 - A2: Backup recovered (transition-only)
 - C3_primary: Low space on primary mount >= 90% (persistent)
@@ -14,6 +14,9 @@ Selected alerts (7 total):
 - E4: Mirror recovered (transition-only)
 - G1: Control API service down (persistent)
 - G2: Backup timer issue (persistent)
+- H1: Nextcloud DB container missing (persistent)
+- H2: Nextcloud unhealthy (persistent)
+- H3: Container update / stack guard failure (persistent)
 
 Paths assume your Chronovault layout:
 - /var/lib/chronovault/status.json
@@ -67,27 +70,25 @@ DISK_USED_WARN_PCT = float(os.environ.get("CHRONOVAULT_DISK_USED_WARN_PCT") or o
 CONTROL_SERVICE = os.environ.get("CHRONOVAULT_CONTROL_SERVICE", "chronovault-control.service")
 BACKUP_TIMER = os.environ.get("CHRONOVAULT_BACKUP_TIMER", "chronovault-backup.timer")
 
+# H checks (container safety)
+NEXTCLOUD_DB_CONTAINER = os.environ.get("CHRONOVAULT_NEXTCLOUD_DB_CONTAINER", "nextcloud-postgres")
+NEXTCLOUD_STATUS_URL = os.environ.get("CHRONOVAULT_NEXTCLOUD_STATUS_URL", "http://127.0.0.1:8080/status.php")
+CONTAINER_UPDATE_FAIL_PATH = os.path.join(STATE_DIR, "container-update-failed.json")
+STACK_GUARD_FAIL_PATH = os.path.join(STATE_DIR, "stack-guard-failed.json")
+
 # Rate limiting (default: resend persistent alerts every 12 hours max)
 # Support both new and old naming for compatibility
 PERSISTENT_REPEAT_SEC = int(os.environ.get("CHRONOVAULT_PERSISTENT_REPEAT_SEC") or os.environ.get("CHRONOVAULT_PERSISTENT_RESEND_SEC", str(12 * 3600)))
 
 # =========================
 # Alert definitions for manual testing
-# Only 7 alerts total:
-# - A1: Backup not OK (persistent)
-# - A2: Backup recovered (transition-only)
-# - C3_primary: Low space on primary (persistent)
-# - C3_backup: Low space on backup (persistent)
-# - E1: Mirror not OK (persistent)
-# - E4: Mirror recovered (transition-only)
-# - G1: Control API service down (persistent)
-# - G2: Backup timer issue (persistent)
 # =========================
 ALL_ALERTS = [
     "A1", "A2",  # Backup status
     "C3_primary", "C3_backup",  # Low space (Primary + Backup)
     "E1", "E4",  # Mirror/sync
     "G1", "G2",  # System health
+    "H1", "H2", "H3",  # Container safety
 ]
 
 # =========================
@@ -296,6 +297,30 @@ def _usage_pct(path: str) -> Optional[float]:
         return (u.used / u.total) * 100.0
     except Exception:
         return None
+
+def _docker_container_running(name: str) -> bool:
+    """Return True if a container name is in docker ps output."""
+    rc, out, _ = _run(["docker", "ps", "--format", "{{.Names}}"])
+    if rc != 0:
+        return False
+    return any(line.strip() == name for line in out.splitlines())
+
+def _nextcloud_status_ok() -> bool:
+    """Return True if Nextcloud status.php responds successfully."""
+    rc, _, _ = _run(["curl", "-sf", NEXTCLOUD_STATUS_URL])
+    return rc == 0
+
+def _container_safety_failure_details() -> str:
+    """Summarize container-update / stack-guard failure state files."""
+    parts: List[str] = []
+    for label, path in (
+        ("container-update", CONTAINER_UPDATE_FAIL_PATH),
+        ("stack-guard", STACK_GUARD_FAIL_PATH),
+    ):
+        data = _load_json(path)
+        if data:
+            parts.append(f"{label}: {json.dumps(data)}")
+    return "; ".join(parts) if parts else "unknown failure"
 
 # =========================
 # Test mode simulation (in-memory only, does not modify files)
@@ -655,6 +680,129 @@ This alert will repeat every {PERSISTENT_REPEAT_SEC // 3600} hours while the iss
     
     return False, 0, 1
 
+def _check_h1_nextcloud_db_missing(notify_state: Dict[str, Any], force: bool = False, dry_run: bool = False) -> Tuple[bool, int, int]:
+    """H1: Nextcloud DB container missing (persistent)."""
+    running = _docker_container_running(NEXTCLOUD_DB_CONTAINER)
+
+    if not force and running:
+        return False, 0, 0
+
+    key = _key("H1_nextcloud_db_missing")
+    sig = "missing"
+    should_send = force or _should_send_persistent(notify_state, key, sig, force=force)
+
+    if should_send:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        body = f"""Container Safety Alert: Nextcloud Database Container Missing
+
+The Nextcloud PostgreSQL container is not running.
+
+Expected container: {NEXTCLOUD_DB_CONTAINER}
+Status: Not found in running containers
+
+Timestamp: {timestamp}
+
+Action Required:
+- Check stack: docker compose -f /opt/chronovault/compose/nextcloud/docker-compose.yml ps
+- Heal stack: cd /opt/chronovault/compose/nextcloud && docker compose up -d
+- Review stack guard logs: /var/log/chronovault/stack-guard.log
+
+This alert will repeat every {PERSISTENT_REPEAT_SEC // 3600} hours while the container remains missing.
+"""
+        res = _send("Container Alert: Nextcloud DB Missing", body, dry_run=dry_run)
+        if res.get("ok"):
+            _mark_sent(notify_state, key, sig)
+            return True, 1, 0
+        elif force:
+            _mark_sent(notify_state, key, sig)
+            print(f"NOTE: Email send failed but test mode forced: {res.get('error', res.get('reason', 'unknown'))}", file=sys.stderr)
+            return True, 1, 0
+
+    return False, 0, 1
+
+def _check_h2_nextcloud_unhealthy(notify_state: Dict[str, Any], force: bool = False, dry_run: bool = False) -> Tuple[bool, int, int]:
+    """H2: Nextcloud unhealthy — DB up but status.php fails (persistent)."""
+    db_running = _docker_container_running(NEXTCLOUD_DB_CONTAINER)
+    status_ok = _nextcloud_status_ok()
+
+    if not force and (not db_running or status_ok):
+        return False, 0, 0
+
+    key = _key("H2_nextcloud_unhealthy")
+    sig = f"db:{db_running}|status:{status_ok}"
+    should_send = force or _should_send_persistent(notify_state, key, sig, force=force)
+
+    if should_send:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        body = f"""Container Safety Alert: Nextcloud Unhealthy
+
+Nextcloud is not responding correctly.
+
+Database container ({NEXTCLOUD_DB_CONTAINER}): {"running" if db_running else "missing"}
+status.php ({NEXTCLOUD_STATUS_URL}): {"OK" if status_ok else "FAILED"}
+
+Timestamp: {timestamp}
+
+Action Required:
+- Check Nextcloud logs: docker logs nextcloud --tail 50
+- Check database logs: docker logs {NEXTCLOUD_DB_CONTAINER} --tail 50
+- Restart stack: cd /opt/chronovault/compose/nextcloud && docker compose up -d
+
+This alert will repeat every {PERSISTENT_REPEAT_SEC // 3600} hours while unhealthy.
+"""
+        res = _send("Container Alert: Nextcloud Unhealthy", body, dry_run=dry_run)
+        if res.get("ok"):
+            _mark_sent(notify_state, key, sig)
+            return True, 1, 0
+        elif force:
+            _mark_sent(notify_state, key, sig)
+            print(f"NOTE: Email send failed but test mode forced: {res.get('error', res.get('reason', 'unknown'))}", file=sys.stderr)
+            return True, 1, 0
+
+    return False, 0, 1
+
+def _check_h3_container_ops_failed(notify_state: Dict[str, Any], force: bool = False, dry_run: bool = False) -> Tuple[bool, int, int]:
+    """H3: Container update or stack guard failure (persistent)."""
+    update_fail = os.path.exists(CONTAINER_UPDATE_FAIL_PATH)
+    guard_fail = os.path.exists(STACK_GUARD_FAIL_PATH)
+
+    if not force and not update_fail and not guard_fail:
+        return False, 0, 0
+
+    key = _key("H3_container_ops_failed")
+    sig = f"update:{update_fail}|guard:{guard_fail}"
+    should_send = force or _should_send_persistent(notify_state, key, sig, force=force)
+
+    if should_send:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        details = _container_safety_failure_details()
+        body = f"""Container Safety Alert: Update or Stack Guard Failure
+
+A container safety operation recorded a failure.
+
+Details: {details}
+
+Timestamp: {timestamp}
+
+Action Required:
+- Container update log: /var/log/chronovault/container-update.log
+- Stack guard log: /var/log/chronovault/stack-guard.log
+- Re-run heal: sudo systemctl start chronovault-stack-guard.service
+- Manual update: sudo /opt/chronovault/scripts/chronovault-container-update.sh --dry-run
+
+This alert will repeat every {PERSISTENT_REPEAT_SEC // 3600} hours while failure state persists.
+"""
+        res = _send("Container Alert: Update/Guard Failure", body, dry_run=dry_run)
+        if res.get("ok"):
+            _mark_sent(notify_state, key, sig)
+            return True, 1, 0
+        elif force:
+            _mark_sent(notify_state, key, sig)
+            print(f"NOTE: Email send failed but test mode forced: {res.get('error', res.get('reason', 'unknown'))}", file=sys.stderr)
+            return True, 1, 0
+
+    return False, 0, 1
+
 # =========================
 # Manual test trigger functions
 # =========================
@@ -674,6 +822,9 @@ def _trigger_test_alert(alert_id: str, notify_state: Dict[str, Any], status: Dic
         "C3_backup": lambda ns, s, f, dr: _check_c3_low_space(ns, "Backup", BACKUP_MOUNT, f, dr),
         "G1": lambda ns, s, f, dr: _check_g1_control_service_down(ns, f, dr),
         "G2": lambda ns, s, f, dr: _check_g2_backup_timer_issue(ns, f, dr),
+        "H1": lambda ns, s, f, dr: _check_h1_nextcloud_db_missing(ns, f, dr),
+        "H2": lambda ns, s, f, dr: _check_h2_nextcloud_unhealthy(ns, f, dr),
+        "H3": lambda ns, s, f, dr: _check_h3_container_ops_failed(ns, f, dr),
     }
     
     # Combine both maps
@@ -766,7 +917,7 @@ def main() -> int:
             _write_json_atomic(NOTIFY_STATE_PATH, notify_state)
         return 0
     
-    # Normal operation: run all checks (only 7 alerts)
+    # Normal operation: run all checks
     sent_count = 0
     suppressed_count = 0
     check_count = 0
@@ -811,6 +962,22 @@ def main() -> int:
     suppressed_count += suppressed
     
     sent, checks, suppressed = _check_g2_backup_timer_issue(notify_state, force=args.force, dry_run=args.dry_run)
+    sent_count += sent
+    check_count += checks
+    suppressed_count += suppressed
+
+    # Group H: Container safety
+    sent, checks, suppressed = _check_h1_nextcloud_db_missing(notify_state, force=args.force, dry_run=args.dry_run)
+    sent_count += sent
+    check_count += checks
+    suppressed_count += suppressed
+
+    sent, checks, suppressed = _check_h2_nextcloud_unhealthy(notify_state, force=args.force, dry_run=args.dry_run)
+    sent_count += sent
+    check_count += checks
+    suppressed_count += suppressed
+
+    sent, checks, suppressed = _check_h3_container_ops_failed(notify_state, force=args.force, dry_run=args.dry_run)
     sent_count += sent
     check_count += checks
     suppressed_count += suppressed

@@ -71,13 +71,22 @@ NEXTCLOUD_ADMIN_PASSWORD={admin_password}
       - /opt/chronovault/env/nextcloud.env
     volumes:
       - /mnt/primary/apps/postgres/nextcloud:/var/lib/postgresql/data
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextcloud -d nextcloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   nextcloud:
     image: nextcloud:{nc_version}
     container_name: nextcloud
     restart: unless-stopped
     depends_on:
-      - nextcloud-db
+      nextcloud-db:
+        condition: service_healthy
     env_file:
       - /opt/chronovault/env/nextcloud.env
     environment:
@@ -88,6 +97,8 @@ NEXTCLOUD_ADMIN_PASSWORD={admin_password}
     volumes:
       - /mnt/primary/apps/nextcloud/html:/var/www/html
       - /mnt/primary/apps/nextcloud/data:/var/www/html/data
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
 
 networks:
   default:
