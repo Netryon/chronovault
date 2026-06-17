@@ -1,5 +1,7 @@
 # ChronoVault
 
+**Version:** 1.1.0 · **Target:** Raspberry Pi 4 (64-bit)
+
 **Secure self-hosted photo and document server with snapshot recovery**
 
 ChronoVault is a low-power, self-hosted storage platform for Raspberry Pi that provides private cloud storage with layered backup and recovery. It runs on a Raspberry Pi 4 and is designed for homelab and personal use. The system combines encrypted storage, containerized services, automated backups, and a control API into a resilient personal storage system capable of recovering deleted or corrupted data for weeks or months, depending on backup capacity.
@@ -38,11 +40,12 @@ Originally a personal project, ChronoVault has evolved into a **storage platform
 - **Layered recovery** — Application trash, daily snapshots (14), and weekly snapshots (12) for multiple restore points
 - **LUKS encryption** — Primary and backup disks encrypted; backup disk mounted only during backup
 - **Automated backups** — systemd timer at 02:00; rsync mirror + hard-link snapshots; DB dumps before sync
-- **Containerized apps** — Immich (photos), Nextcloud (documents), DuckDNS, Twingate, Watchtower
+- **Containerized apps** — Immich (photos), Nextcloud (documents), DuckDNS, Twingate; safe daily compose-stack updates
 - **Control API & UI** — Python/FastAPI dashboard for status, restore points, manual backup, and restore
 - **Zero-trust remote access** — Twingate (no router port forwarding)
 - **Ransomware protection** — Catastrophic-change detection freezes backups until manual approval
-- **Email alerts** — SMTP notifications for backup failure, recovery, mirror errors, low space, service issues
+- **Email alerts** — SMTP notifications for backup, mirror, disk space, service health, and container safety (H1/H2/H3)
+- **Stack guard** — Auto-heals missing or unhealthy Nextcloud/Immich stacks every 15 minutes
 
 ---
 
@@ -89,7 +92,8 @@ Backups are driven by **systemd timers**.
 3. Sync files with **rsync** (mirror to `current/`)  
 4. Create incremental snapshots using **hard links** (`--link-dest`)  
 5. Apply retention (14 daily, 12 weekly)  
-6. Unmount and lock backup disk  
+6. Reconcile Nextcloud and Immich compose stacks  
+7. Unmount and lock backup disk  
 
 **Snapshot layout**
 
@@ -109,16 +113,17 @@ Snapshots use **hard-link deduplication**: only changed files use extra space.
 
 Services run in **Docker containers**.
 
-| Service    | Purpose                                  | Port / role   |
-|------------|------------------------------------------|---------------|
-| Immich     | Photo and video management               | 2283          |
-| Nextcloud  | Documents and collaboration              | 8080          |
-| Control UI | Status, restore points, backup & restore | 8787          |
-| DuckDNS    | Dynamic hostname                         | internal      |
-| Twingate   | Secure remote access                     | internal      |
-| Watchtower | Automatic container image updates        | internal      |
+| Service      | Purpose                                  | Port / role   |
+|--------------|------------------------------------------|---------------|
+| Immich       | Photo and video management               | 2283          |
+| Nextcloud    | Documents and collaboration              | 8080          |
+| Control UI   | Status, restore points, backup & restore | 8787          |
+| DuckDNS      | Dynamic hostname                         | internal      |
+| Twingate     | Secure remote access                     | internal      |
+| Safe updater | Daily compose-stack image updates        | internal      |
+| Stack guard  | Heal missing/unhealthy app stacks        | every 15 min  |
 
-Containers can be updated, restarted, or replaced independently.
+Application stacks are updated as **whole compose units** (app + database together), not one container at a time.
 
 ---
 
@@ -194,8 +199,11 @@ Health checks run every **5 minutes** (systemd timer). Alerts are sent via **SMT
 - Storage usage ≥ 90% (primary or backup)  
 - Control API service down  
 - Backup timer disabled or inactive  
+- Nextcloud DB container missing (**H1**)  
+- Nextcloud unhealthy — `status.php` fails (**H2**)  
+- Container update or stack guard failure (**H3**)  
 
-Rate limiting avoids spamming the same alert; persistent issues re-notify on a configurable interval (e.g. every 24 hours).
+Rate limiting avoids spamming the same alert; persistent issues re-notify on a configurable interval (default: every 12 hours).
 
 ---
 
@@ -211,25 +219,29 @@ Rate limiting avoids spamming the same alert; persistent issues re-notify on a c
 | Actions   | `apt-get update`, `apt-get upgrade -y`, optional Docker package upgrade, `autoremove`, `autoclean` |
 | Log       | `/var/log/chronovault/system-update.log` |
 
-### Container updates
+### Container updates (v1.1)
 
 | Component | Detail |
 |-----------|--------|
-| Tool      | **Watchtower** (containerrr/watchtower) |
-| Schedule  | Daily at 05:00 |
-| Behavior  | Pull new images, recreate containers; cleanup old images; no volume removal |
+| Tool      | **ChronoVault Safe Container Updater** (`chronovault-container-update.sh`) |
+| Schedule  | Daily at 05:00 UTC |
+| Behavior  | `docker compose pull` + `docker compose up -d` per stack (nextcloud → immich → twingate → control → duckdns); health checks after each stack |
+| Stack guard | `chronovault-stack-guard.sh` every 15 minutes — heals missing DB / failed health checks |
+| Log       | `/var/log/chronovault/container-update.log`, `/var/log/chronovault/stack-guard.log` |
 
 | Layer      | Mechanism     | Schedule | What’s updated      |
 |------------|---------------|----------|----------------------|
 | Host OS    | systemd timer | Weekly   | System packages      |
 | Docker     | apt upgrade   | Weekly   | docker.io / compose  |
-| Containers | Watchtower    | Daily    | All service images   |
+| Containers | Safe updater  | Daily    | All compose stacks (whole stack, not per-container) |
+
+**Note:** Watchtower was removed in v1.1. Per-container auto-updates could stop a database container without recreating it, leaving the app stack broken. The safe updater updates entire stacks together.
 
 ---
 
 ## Hardware Requirements
 
-Optimized for low-power hardware.
+Optimized for Raspberry Pi 4.
 
 | Component       | Recommendation              |
 |----------------|-----------------------------|
@@ -266,16 +278,18 @@ Backup disk (encrypted, mounted only during backup)
 
 ```
 chronovault/
-├── docker/          # Compose templates (Immich, Nextcloud, DuckDNS, Twingate, Watchtower)
-├── scripts/         # chronovault-backup-run, chronovault-restore, mount/umount, system-update
-├── api/             # main.py (FastAPI), mailer.py, notify.py
-├── ui/              # index.html, app.js, style.css, ui-config.js
-├── installer/       # chronovault-installer.py + steps (18-step automated installer)
-├── docs/            # Additional documentation (optional)
+├── assets/                    # Screenshots and images
+├── installer/
+│   ├── chronovault-installer.py
+│   └── installer/
+│       ├── steps/             # 18 installer steps
+│       └── scripts/           # Backup, restore, notify, updater, guard, UI
+├── CHANGELOG.md
+├── LICENSE
 └── README.md
 ```
 
-Compose files and env templates are generated or copied by the installer; secrets (tokens, passwords) are never stored in the repo.
+Compose files and env templates are generated by the installer during setup. Secrets (tokens, passwords) are never stored in the repo.
 
 ---
 
@@ -286,12 +300,13 @@ A **stateful, interactive installer** turns a fresh Raspberry Pi OS (or Debian-b
 **Run**
 
 ```bash
+cd installer
 sudo python3 chronovault-installer.py
 ```
 
 **What it does**
 
-- **18 steps** in order: system check, packages, SSH, firewall, folders, disk selection, LUKS encryption, auto-unlock (with optional reboot), app dirs, Docker, DuckDNS, Immich, Twingate, Nextcloud, control API + UI, initial backup, email config, timers + Watchtower  
+- **18 steps** in order: system check, packages, SSH, firewall, folders, disk selection, LUKS encryption, auto-unlock (with optional reboot), app dirs, Docker, DuckDNS, Immich, Twingate, Nextcloud, control API + UI, initial backup, email config, timers + container maintenance  
 - **State file** (`/root/.chronovault-installer-state.json`): current step, completed steps, and config (disks, domains, etc.)  
 - **Resume:** After a reboot or interrupt, re-run the script and continue from the last step  
 - **Prompts only** for what’s needed (disks, LUKS passwords, DuckDNS token, Twingate tokens, SMTP, etc.)  
@@ -306,7 +321,7 @@ No secrets or keys are stored in the repository; they are created on the host du
 ### Backup (automated or manual)
 
 ```
-Mount backup disk → Create DB dumps → Stop app containers → rsync mirror → Daily/weekly snapshots → Retention → Unmount backup disk
+Mount backup disk → Create DB dumps → Stop app containers → rsync mirror → Daily/weekly snapshots → Retention → Reconcile stacks → Unmount backup disk
 ```
 
 ### Restore (UI, API, or CLI)
@@ -330,9 +345,10 @@ This project demonstrates:
 - **Docker orchestration** — Compose, multi-service stack, networking  
 - **Encrypted storage** — LUKS, key files, on-demand backup mount  
 - **Backup architecture** — rsync, hard-link snapshots, retention, DB dumps  
-- **Security design** — no backup port forwarding, offline backup disk, SSH hardening  
+- **Security design** — no port forwarding, offline backup disk, SSH hardening  
 - **API development** — FastAPI, token auth, REST actions  
 - **System automation** — timers, notifications, backup/restore flows  
+- **Container safety** — compose-stack updates, health checks, auto-heal  
 
 ---
 
